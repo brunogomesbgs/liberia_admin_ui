@@ -22,6 +22,9 @@ import { AuthService } from '../services/auth.service';
             <span *ngIf="msg.feedback" class="feedback-icon" [title]="msg.feedback">
               {{ msg.feedback === 'up' ? '👍' : '👎' }}
             </span>
+            <small *ngIf="msg.top_similarity_score !== null && msg.top_similarity_score !== undefined" style="margin-left: 6px; color: #3f51b5;">
+              (Sim: {{ msg.top_similarity_score | number:'1.2-2' }}, Chunks: {{ msg.retrieved_chunk_ids?.length || 0 }})
+            </small>
           </div>
           <div class="content">{{ msg.content }}</div>
         </div>

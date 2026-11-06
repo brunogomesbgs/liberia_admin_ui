@@ -24,6 +24,7 @@ import { AuthService } from '../services/auth.service';
         <button [class.active]="activeTab() === 'users'" (click)="setTab('users')">Users</button>
         <button [class.active]="activeTab() === 'books'" (click)="setTab('books')">Books</button>
         <button [class.active]="activeTab() === 'chats'" (click)="setTab('chats')">Chat Requests</button>
+        <button [class.active]="activeTab() === 'evaluation'" (click)="setTab('evaluation')">RAG Evaluation</button>
       </div>
       <div class="nav-auth">
         <button (click)="logout()">Logout</button>
@@ -35,6 +36,60 @@ import { AuthService } from '../services/auth.service';
       <app-book-list *ngIf="activeTab() === 'books'" [books]="books()"></app-book-list>
       <app-chat-requests *ngIf="activeTab() === 'chats' && !selectedChatId()" [requestedChats]="requestedChats()" (onAnswer)="answerChat($event)"></app-chat-requests>
       <app-chat-detail *ngIf="activeTab() === 'chats' && selectedChatId()" [sessionId]="selectedChatId()!" [apiUrl]="apiUrl" (onClose)="closeChat()" (onReplied)="onReplied()"></app-chat-detail>
+
+      <div *ngIf="activeTab() === 'evaluation'" class="eval-section">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+          <h2>Retrieval & RAGAS Evaluation Telemetry</h2>
+          <button (click)="runBenchmark()" [disabled]="benchmarkRunning()" style="padding: 8px 16px; background: #007bff; color: #fff; border: none; border-radius: 4px; cursor: pointer;">
+            {{ benchmarkRunning() ? 'Running Benchmark...' : 'Run IR + RAGAS Benchmark' }}
+          </button>
+        </div>
+
+        <div *ngIf="evaluationSummary()" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px;">
+          <div style="padding: 16px; border: 1px solid #ddd; border-radius: 8px; background: #fff;">
+            <h3>Indexed Corpus</h3>
+            <p>Total Books: <strong>{{ evaluationSummary()?.corpus?.total_books ?? 0 }}</strong></p>
+            <p>Indexed Chunks: <strong>{{ evaluationSummary()?.corpus?.total_chunks ?? 0 }}</strong></p>
+          </div>
+          <div style="padding: 16px; border: 1px solid #ddd; border-radius: 8px; background: #fff;">
+            <h3>User Feedback</h3>
+            <p>Evaluated Responses: <strong>{{ evaluationSummary()?.feedback?.evaluated_messages ?? 0 }}</strong></p>
+            <p>Thumbs Up / Down: <strong>{{ evaluationSummary()?.feedback?.thumbs_up ?? 0 }} / {{ evaluationSummary()?.feedback?.thumbs_down ?? 0 }}</strong></p>
+            <p>Approval Rate: <strong>{{ evaluationSummary()?.feedback?.approval_rate !== null ? ((evaluationSummary()?.feedback?.approval_rate * 100) | number:'1.0-1') + '%' : 'N/A' }}</strong></p>
+          </div>
+          <div style="padding: 16px; border: 1px solid #ddd; border-radius: 8px; background: #fff;">
+            <h3>Similarity & Escalation</h3>
+            <p>Avg Top Similarity: <strong>{{ evaluationSummary()?.retrieval_telemetry?.avg_top_similarity ?? 'N/A' }}</strong></p>
+            <p>Active Escalations: <strong>{{ evaluationSummary()?.sessions?.active_escalations ?? 0 }}</strong></p>
+          </div>
+        </div>
+
+        <div *ngIf="benchmarkResult()" style="padding: 16px; border: 1px solid #cce5ff; border-radius: 8px; background: #f8fbff;">
+          <h3>Latest Benchmark Results (k = {{ benchmarkResult()?.k }}, samples = {{ benchmarkResult()?.sample_count }})</h3>
+          <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;">
+            <div>
+              <h4>IR Metrics</h4>
+              <ul>
+                <li>HitRate@k: <strong>{{ benchmarkResult()?.ir_metrics?.hit_rate_at_k }}</strong></li>
+                <li>Recall@k: <strong>{{ benchmarkResult()?.ir_metrics?.recall_at_k }}</strong></li>
+                <li>Precision@k: <strong>{{ benchmarkResult()?.ir_metrics?.precision_at_k }}</strong></li>
+                <li>MRR@k: <strong>{{ benchmarkResult()?.ir_metrics?.mrr_at_k }}</strong></li>
+                <li>nDCG@k: <strong>{{ benchmarkResult()?.ir_metrics?.ndcg_at_k }}</strong></li>
+                <li>MAP@k: <strong>{{ benchmarkResult()?.ir_metrics?.map_at_k }}</strong></li>
+              </ul>
+            </div>
+            <div>
+              <h4>RAGAS Metrics</h4>
+              <ul>
+                <li>Context Precision: <strong>{{ benchmarkResult()?.ragas_metrics?.context_precision }}</strong></li>
+                <li>Context Recall: <strong>{{ benchmarkResult()?.ragas_metrics?.context_recall }}</strong></li>
+                <li>Faithfulness: <strong>{{ benchmarkResult()?.ragas_metrics?.faithfulness }}</strong></li>
+                <li>Answer Relevancy: <strong>{{ benchmarkResult()?.ragas_metrics?.answer_relevancy }}</strong></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   `,
   styles: [`
@@ -84,8 +139,11 @@ export class DashboardComponent implements OnInit {
   users = signal<any[]>([]);
   books = signal<any[]>([]);
   requestedChats = signal<any[]>([]);
+  evaluationSummary = signal<any | null>(null);
+  benchmarkResult = signal<any | null>(null);
+  benchmarkRunning = signal<boolean>(false);
 
-  activeTab = signal<'users' | 'books' | 'chats'>('users');
+  activeTab = signal<'users' | 'books' | 'chats' | 'evaluation'>('users');
   selectedChatId = signal<string | null>(null);
 
   protected apiUrl = '';
@@ -131,6 +189,35 @@ export class DashboardComponent implements OnInit {
       error: err => console.error('Failed to load books', err)
     });
     this.loadRequestedChats();
+    this.loadEvaluationSummary();
+  }
+
+  loadEvaluationSummary() {
+    const token = this.authService.getToken();
+    if (!token) return;
+    const headers = { 'Authorization': `Bearer ${token}` };
+    this.http.get<any>(`${this.apiUrl}/admin/evaluation/summary`, { headers }).subscribe({
+      next: data => this.evaluationSummary.set(data),
+      error: err => console.error('Failed to load evaluation summary', err)
+    });
+  }
+
+  runBenchmark() {
+    const token = this.authService.getToken();
+    if (!token) return;
+    this.benchmarkRunning.set(true);
+    const headers = { 'Authorization': `Bearer ${token}` };
+    this.http.post<any>(`${this.apiUrl}/admin/evaluation/benchmark`, { k: 5, max_samples: 10 }, { headers }).subscribe({
+      next: data => {
+        this.benchmarkResult.set(data);
+        this.benchmarkRunning.set(false);
+        this.loadEvaluationSummary();
+      },
+      error: err => {
+        console.error('Failed to run benchmark', err);
+        this.benchmarkRunning.set(false);
+      }
+    });
   }
 
   loadRequestedChats() {
@@ -148,8 +235,11 @@ export class DashboardComponent implements OnInit {
     });
   }
 
-  setTab(tab: 'users' | 'books' | 'chats') {
+  setTab(tab: 'users' | 'books' | 'chats' | 'evaluation') {
     this.activeTab.set(tab);
+    if (tab === 'evaluation') {
+      this.loadEvaluationSummary();
+    }
   }
 
   createUser(userData: {username: string, password_hash: string}) {
